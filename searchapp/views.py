@@ -1,32 +1,51 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+
+import os
 import requests
 from bs4 import BeautifulSoup
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
-import os
 
-# Try tiktoken if available
+from pymilvus import (
+    connections, FieldSchema, CollectionSchema,
+    DataType, Collection, utility
+)
+
+# Optional tokenization using tiktoken
 try:
     import tiktoken
-    TIKTOKEN_AVAILABLE = True
-except Exception:
-    TIKTOKEN_AVAILABLE = False
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
 
-# ---------- CONFIG ----------
+
+# ----------------------------
+# App Config
+# ----------------------------
 MILVUS_HOST = os.environ.get("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
 COLLECTION_NAME = "html_chunks"
-EMBED_DIM = 384
-MAX_TOKENS = 500
 
-# Connect to Milvus
-connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+EMBEDDING_DIM = 384
+MAX_TOKENS = 500    # chunk limit
 
-# Ensure Milvus collection
-def ensure_collection():
+
+# ----------------------------
+# Milvus Setup
+# ----------------------------
+connections.connect(
+    alias="default",
+    host=MILVUS_HOST,
+    port=MILVUS_PORT
+)
+
+def get_or_create_collection():
+    """
+    Create the Milvus collection only if it doesn't already exist.
+    """
     if utility.has_collection(COLLECTION_NAME):
         return Collection(COLLECTION_NAME)
 
@@ -34,116 +53,169 @@ def ensure_collection():
         FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
         FieldSchema(name="url", dtype=DataType.VARCHAR, max_length=2048),
         FieldSchema(name="chunk_text", dtype=DataType.VARCHAR, max_length=65535),
+        FieldSchema(name="html_block", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="token_count", dtype=DataType.INT64),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBED_DIM),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
     ]
-    schema = CollectionSchema(fields, description="HTML chunks")
-    collection = Collection(COLLECTION_NAME, schema=schema)
-    collection.create_index("embedding", {"index_type": "HNSW", "metric_type": "IP", "params": {"M": 16, "efConstruction": 200}})
+
+    schema = CollectionSchema(fields, description="Stores extracted <div> chunks")
+    collection = Collection(COLLECTION_NAME, schema)
+
+    # Basic HNSW index — keeps search fast
+    index_cfg = {
+        "index_type": "HNSW",
+        "metric_type": "IP",
+        "params": {"M": 16, "efConstruction": 200}
+    }
+    collection.create_index("embedding", index_cfg)
     collection.load()
+
     return collection
 
-collection = ensure_collection()
-model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# ---------- UTILS ----------
-def fetch_html(url):
-    r = requests.get(url, headers={"User-Agent": "html-search-bot/1.0"}, timeout=10)
-    r.raise_for_status()
-    return r.text
+collection = get_or_create_collection()
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-def extract_text(html):
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def fetch_html(url: str) -> str:
+    resp = requests.get(
+        url,
+        headers={"User-Agent": "html-scraper/1.0"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def extract_div_elements(html: str):
+    """
+    Pull out each <div> and return (plain_text, html_string)
+    """
     soup = BeautifulSoup(html, "html.parser")
-    for s in soup(["script", "style", "noscript"]):
-        s.decompose()
-    text = soup.get_text(separator="\n")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    divs = soup.find_all("div")
 
-def tokenize_and_chunk(text, max_tokens=MAX_TOKENS):
-    if TIKTOKEN_AVAILABLE:
+    output = []
+    for div in divs:
+        text = div.get_text(" ", strip=True)
+        if text:
+            output.append((text, str(div)))
+
+    return output
+
+
+def chunk_by_tokens(text: str, limit: int = MAX_TOKENS):
+    """
+    Break a large text into smaller pieces.
+    If tiktoken is not installed, fall back to word-based splitting.
+    """
+    if HAS_TIKTOKEN:
         enc = tiktoken.get_encoding("cl100k_base")
-        token_ids = enc.encode(text)
+        tokens = enc.encode(text)
+
         chunks = []
-        for i in range(0, len(token_ids), max_tokens):
-            chunk_ids = token_ids[i:i+max_tokens]
-            chunk_text = enc.decode(chunk_ids)
-            chunks.append((chunk_text, len(chunk_ids)))
-        return chunks
-    else:
-        words = text.split()
-        chunks = []
-        for i in range(0, len(words), max_tokens):
-            chunk_words = words[i:i+max_tokens]
-            chunk_text = " ".join(chunk_words)
-            chunks.append((chunk_text, len(chunk_words)))
+        for i in range(0, len(tokens), limit):
+            sub = tokens[i:i + limit]
+            chunks.append((enc.decode(sub), len(sub)))
         return chunks
 
-def embed_texts(texts):
-    embs = model.encode(texts, convert_to_numpy=True)
-    norms = np.linalg.norm(embs, axis=1, keepdims=True)
-    norms[norms == 0] = 1
-    return embs / norms
+    # fallback: simple word split
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), limit):
+        segment = words[i:i + limit]
+        chunks.append((" ".join(segment), len(segment)))
+    return chunks
 
-# ---------- API VIEWS ----------
+
+def embed(text_list):
+    emb = embedder.encode(text_list, convert_to_numpy=True)
+    norm = np.linalg.norm(emb, axis=1, keepdims=True)
+    norm[norm == 0] = 1
+    return emb / norm
+
+
+# ----------------------------
+# DRF Views
+# ----------------------------
 class IndexView(APIView):
+    """
+    Extract all <div> tags from a webpage, embed them,
+    and store them in Milvus.
+    """
     def post(self, request):
         url = request.data.get("url")
         if not url:
-            return Response({"error": "URL is required"}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            html = fetch_html(url)
-            text = extract_text(html)
-            chunks = tokenize_and_chunk(text)
-            chunk_texts = [c[0] for c in chunks]
-            token_counts = [c[1] for c in chunks]
-            embeddings = embed_texts(chunk_texts)
+            return Response({"error": "URL is required"}, status=400)
 
+        try:
+            raw_html = fetch_html(url)
+            div_data = extract_div_elements(raw_html)
+
+            if not div_data:
+                return Response({"error": "No <div> blocks found"}, status=404)
+
+            texts = [t for t, _ in div_data]
+            html_blobs = [h for _, h in div_data]
+            token_counts = [len(t.split()) for t in texts]
+
+            vectors = embed(texts).tolist()
+
+            # Insert in the same order as schema (except id)
             entities = [
-                [url] * len(chunk_texts),
-                chunk_texts,
+                [url] * len(texts),
+                texts,
+                html_blobs,
                 token_counts,
-                embeddings.tolist(),
+                vectors,
             ]
+
             collection.insert(entities)
             collection.flush()
 
-            return Response({"url": url, "chunks_indexed": len(chunk_texts)}, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"url": url, "indexed": len(texts)},
+                status=status.HTTP_201_CREATED
+            )
+
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=400)
+
 
 class SearchView(APIView):
+    """
+    Perform semantic search inside Milvus.
+    """
     def post(self, request):
         query = request.data.get("query")
         if not query:
-            return Response({"error": "Query required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Query required"}, status=400)
 
-        # Compute query embedding
-        q_emb = embed_texts([query])[0]
+        q_vec = embed([query])[0]
+
         collection.load()
-        search_params = {"metric_type": "IP", "params": {"ef": 50}}
+        search_params = {
+            "metric_type": "IP",
+            "params": {"ef": 200}
+        }
 
-        # Run Milvus semantic search
-        search_results = collection.search(
-            data=[q_emb.tolist()],
+        res = collection.search(
+            data=[q_vec.tolist()],
             anns_field="embedding",
             param=search_params,
             limit=10,
-            output_fields=["chunk_text", "token_count", "url"]
+            output_fields=["chunk_text", "html_block", "token_count", "url"]
         )
 
-        # Build response
-        hits = []
-        for hit in search_results[0]:
-            snippet = hit.entity.get("chunk_text")
-            token_count = int(hit.entity.get("token_count"))
-            url = hit.entity.get("url")
-
-            hits.append({
-                "score": float(hit.score),       # ✅ Correct variable
-                "snippet": snippet,
-                "token_count": token_count,
-                "url": url
+        out = []
+        for hit in res[0]:
+            out.append({
+                "score": float(hit.score),
+                "text": hit.entity.get("chunk_text"),
+                "html": hit.entity.get("html_block"),
+                "url": hit.entity.get("url"),
             })
 
-        return Response({"results": hits})
+        return Response({"results": out})
